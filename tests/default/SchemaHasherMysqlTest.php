@@ -43,9 +43,10 @@ class SchemaHasherMysqlTest extends TestCase
 
     /**
      * Regression: the columns were sorted in a derived table and aggregated
-     * outside it. MySQL 8 merges that derived table and drops its ORDER BY, so
-     * GROUP_CONCAT consumed the rows in data dictionary order (by ordinal
-     * position) instead - a property of the server rather than of the schema.
+     * outside it. Whether that ORDER BY survives is up to the optimizer - when
+     * the derived table is merged the sort is dropped and GROUP_CONCAT consumes
+     * the rows in data dictionary order instead, which is a property of the
+     * server and not of the schema.
      */
     public function testSchemaHashIsTheColumnSignatureSortedByName(): void
     {
