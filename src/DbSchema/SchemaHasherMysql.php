@@ -52,7 +52,8 @@ final class SchemaHasherMysql implements SchemaHasher
                             COALESCE(COLUMN_NAME, ''),
                             COALESCE(EXTRA, ''),
                             COLUMN_TYPE,
-                            IS_NULLABLE
+                            IS_NULLABLE,
+                            ORDINAL_POSITION
                         )
                         ORDER BY TABLE_NAME, COLUMN_NAME
                     )

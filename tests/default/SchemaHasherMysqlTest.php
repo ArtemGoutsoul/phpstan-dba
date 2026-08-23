@@ -7,107 +7,101 @@ namespace staabm\PHPStanDba\Tests;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use staabm\PHPStanDba\DbSchema\SchemaHasherMysql;
+use function getenv;
 
-final class SchemaHasherMysqlTest extends TestCase
+class SchemaHasherMysqlTest extends TestCase
 {
+    /**
+     * A database of our own, so the hash covers a schema this test controls entirely.
+     */
     private const DATABASE_NAME = 'phpstan_dba_schema_hash_test';
 
-    private ?PDO $connection = null;
+    private PDO $connection;
 
     protected function setUp(): void
     {
-        if (! \in_array(self::env('DBA_REFLECTOR', ''), ['mysqli', 'pdo-mysql'], true)) {
+        if (! \in_array(getenv('DBA_REFLECTOR'), ['mysqli', 'pdo-mysql'], true)) {
             self::markTestSkipped('MySQL reflector required.');
         }
 
-        if (false === strpos(self::env('DBA_MODE', ''), 'recording')) {
-            self::markTestSkipped('Recording mode required, hashing a schema needs a database connection.');
+        if (! \in_array(getenv('DBA_MODE'), [ReflectorFactory::MODE_RECORDING, ReflectorFactory::MODE_REPLAY_AND_RECORDING], true)) {
+            self::markTestSkipped('Hashing a schema requires a database connection.');
         }
 
-        if (! \extension_loaded('pdo_mysql')) {
-            self::markTestSkipped('ext-pdo_mysql required.');
-        }
-
-        // hash a database of our own, so the tests are independent of the schema the other tests use
-        $this->connection = self::createPdo(null);
-        $this->connection->exec('DROP DATABASE IF EXISTS ' . self::DATABASE_NAME);
-        $this->connection->exec('CREATE DATABASE ' . self::DATABASE_NAME);
-        $this->connection->exec('USE ' . self::DATABASE_NAME);
+        $this->connection = self::connect(null);
+        $this->exec('DROP DATABASE IF EXISTS ' . self::DATABASE_NAME);
+        $this->exec('CREATE DATABASE ' . self::DATABASE_NAME);
+        $this->exec('USE ' . self::DATABASE_NAME);
     }
 
     protected function tearDown(): void
     {
-        if (null !== $this->connection) {
-            $this->connection->exec('DROP DATABASE IF EXISTS ' . self::DATABASE_NAME);
-            $this->connection = null;
+        if (isset($this->connection)) {
+            $this->exec('DROP DATABASE IF EXISTS ' . self::DATABASE_NAME);
         }
     }
 
-    public function testSchemaHashIgnoresTheOrderColumnsAreDeclaredIn(): void
+    /**
+     * Regression: the columns were sorted in a derived table and aggregated
+     * outside it. MySQL 8 merges that derived table and drops its ORDER BY, so
+     * GROUP_CONCAT consumed the rows in data dictionary order (by ordinal
+     * position) instead - a property of the server rather than of the schema.
+     */
+    public function testSchemaHashIsTheColumnSignatureSortedByName(): void
     {
-        $this->exec('CREATE TABLE t (zebra int NOT NULL, apple varchar(10) NULL)');
-        $hash = self::hashDb();
-        self::assertMatchesRegularExpression('/^[a-f0-9]{32}$/', $hash);
+        $this->exec('CREATE TABLE t (zebra varchar(10) NOT NULL, apple date NULL)');
 
-        $this->exec('DROP TABLE t');
-        $this->exec('CREATE TABLE t (apple varchar(10) NULL, zebra int NOT NULL)');
-
-        self::assertSame($hash, self::hashDb());
+        self::assertSame(md5('appledateYES2,zebravarchar(10)NO1'), $this->hashDb());
     }
 
-    public function testSchemaHashIgnoresTheOrderTablesAreCreatedIn(): void
-    {
-        $this->exec('CREATE TABLE zebra (id int NOT NULL)');
-        $this->exec('CREATE TABLE apple (name varchar(10) NULL)');
-        $hash = self::hashDb();
-
-        $this->exec('DROP TABLE zebra');
-        $this->exec('CREATE TABLE zebra (id int NOT NULL)');
-
-        self::assertSame($hash, self::hashDb());
-    }
-
-    public function testSchemaHashChangesWithTheSchema(): void
+    public function testSchemaHashIsStable(): void
     {
         $this->exec('CREATE TABLE t (id int NOT NULL)');
-        $initialHash = self::hashDb();
-        self::assertSame($initialHash, self::hashDb());
 
-        $this->exec('ALTER TABLE t RENAME COLUMN id TO record_id');
-        $renamedColumnHash = self::hashDb();
-        self::assertNotSame($initialHash, $renamedColumnHash);
+        self::assertSame($this->hashDb(), $this->hashDb());
+    }
 
-        $this->exec('ALTER TABLE t MODIFY record_id bigint NOT NULL');
-        $changedTypeHash = self::hashDb();
-        self::assertNotSame($renamedColumnHash, $changedTypeHash);
+    /**
+     * @dataProvider provideSchemaChanges
+     */
+    public function testSchemaHashChangesWithTheSchema(string $schemaChange): void
+    {
+        $this->exec('CREATE TABLE t (id int NOT NULL, name varchar(10) NULL)');
+        $hash = $this->hashDb();
 
-        $this->exec('ALTER TABLE t MODIFY record_id bigint NULL');
-        $nullableHash = self::hashDb();
-        self::assertNotSame($changedTypeHash, $nullableHash);
+        $this->exec($schemaChange);
 
-        $this->exec('CREATE TABLE t2 (id int NOT NULL)');
-        self::assertNotSame($nullableHash, self::hashDb());
+        self::assertNotSame($hash, $this->hashDb());
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public function provideSchemaChanges(): iterable
+    {
+        yield 'renamed column' => ['ALTER TABLE t CHANGE id record_id int NOT NULL'];
+        yield 'changed column type' => ['ALTER TABLE t MODIFY id bigint NOT NULL'];
+        yield 'column turned nullable' => ['ALTER TABLE t MODIFY id int NULL'];
+        yield 'reordered columns' => ['ALTER TABLE t MODIFY name varchar(10) NULL FIRST'];
+        yield 'added column' => ['ALTER TABLE t ADD extra int NULL'];
+        yield 'added table' => ['CREATE TABLE t2 (id int NOT NULL)'];
     }
 
     private function exec(string $statement): void
     {
-        if (null === $this->connection) {
-            self::fail('No connection.');
-        }
-
         $this->connection->exec($statement);
     }
 
     /**
-     * A fresh connection per hash: DDL of another connection is invisible within
-     * the transaction the hasher runs in.
+     * A connection of its own per hash: DDL of another connection is invisible
+     * within the transaction the hasher runs in.
      */
-    private static function hashDb(): string
+    private function hashDb(): string
     {
-        return (new SchemaHasherMysql(self::createPdo(self::DATABASE_NAME)))->hashDb();
+        return (new SchemaHasherMysql(self::connect(self::DATABASE_NAME)))->hashDb();
     }
 
-    private static function createPdo(?string $database): PDO
+    private static function connect(?string $database): PDO
     {
         $host = self::env('DBA_HOST', '127.0.0.1');
         $port = '';
@@ -116,19 +110,14 @@ final class SchemaHasherMysqlTest extends TestCase
             $port = ';port=' . $port;
         }
 
-        $dsn = sprintf('mysql:host=%s', $host) . $port;
+        $dsn = 'mysql:host=' . $host . $port;
         if (null !== $database) {
             $dsn .= ';dbname=' . $database;
         }
 
-        return new PDO(
-            $dsn,
-            self::env('DBA_USER', 'root'),
-            self::env('DBA_PASSWORD', 'root'),
-            [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            ]
-        );
+        return new PDO($dsn, self::env('DBA_USER', 'root'), self::env('DBA_PASSWORD', 'root'), [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        ]);
     }
 
     private static function env(string $name, string $default): string
